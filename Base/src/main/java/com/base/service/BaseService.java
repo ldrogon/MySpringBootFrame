@@ -3,14 +3,19 @@ package com.base.service;
 import com.base.annotation.ReferCollection;
 import com.base.annotation.ReferredCollection;
 import com.base.condition.BaseCondition;
+import com.base.define.BaseErrorDefine;
+import com.base.exception.BaseRuntimeException;
 import com.base.util.BeanUtil;
 import com.base.util.ConditionUtil;
+import com.base.util.ExceptionUtil;
 import com.base.util.I18nUtil;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.data.jpa.domain.Specification;
+import org.springframework.messaging.support.ErrorMessage;
 import org.springframework.transaction.annotation.Transactional;
 
 import javax.persistence.*;
@@ -18,6 +23,7 @@ import javax.persistence.criteria.*;
 import java.io.Serializable;
 import java.lang.annotation.Annotation;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.ParameterizedType;
 import java.math.BigInteger;
 import java.util.*;
@@ -140,17 +146,18 @@ public class BaseService<T,K extends Serializable> {
      */
     @Transactional
     public T saveIngoreNull(T t){
-        T returnVal;
-        Object val= BeanUtil.getPKValByJPAAnnotation(t);
-        if(val==null){
-            returnVal=save(t);
-        }else{
-            T dbt=findOne((K)val);
-            if(dbt==null){
-                throw new RuntimeException("未找到对应Id的记录，无法进行更新!");
+        T returnVal=null;
+        try {
+            Object val= BeanUtil.getPKValByJPAAnnotation(t);
+            if(val==null){
+                returnVal=save(t);
+            }else{
+                T dbt=findOne((K)val);
+                BeanUtil.autoInversionForBaseAttrForNull(dbt,t);
+                returnVal=save(t);
             }
-            BeanUtil.autoInversionForBaseAttrForNull(dbt,t);
-            returnVal=save(t);
+        } catch (Exception e) {
+            ExceptionUtil.catchNonBaseRuntimeException(e,BaseErrorDefine.ERROR_EXECUTE_SAVEINGORENULL.toRuntimeException());
         }
         return returnVal;
     }
@@ -217,29 +224,33 @@ public class BaseService<T,K extends Serializable> {
      */
     @Transactional
     public void saveBatch(List<T> list){
-        List<T> insertList=new ArrayList<>();
-        List<T> updateList=new ArrayList<>();
-        list.forEach(e->{
-            Object obj=BeanUtil.getPKValByJPAAnnotation(e);
-            if(obj==null){
-                insertList.add(e);
-            }else{
-                updateList.add(e);
+        try {
+            List<T> insertList=new ArrayList<>();
+            List<T> updateList=new ArrayList<>();
+            for(T e:list){
+                Object obj = BeanUtil.getPKValByJPAAnnotation(e);
+                if (obj == null) {
+                    insertList.add(e);
+                } else {
+                    updateList.add(e);
+                }
             }
-        });
-        for (int i = 0; i < insertList.size(); i++) {
-            em.persist(insertList.get(i));
-            if (i % 100 == 0) {
-                em.flush();
-                em.clear();
+            for (int i = 0; i < insertList.size(); i++) {
+                em.persist(insertList.get(i));
+                if (i % 100 == 0) {
+                    em.flush();
+                    em.clear();
+                }
             }
-        }
-        for (int i = 0; i < updateList.size(); i++) {
-            em.merge(updateList.get(i));
-            if (i % 100 == 0) {
-                em.flush();
-                em.clear();
+            for (int i = 0; i < updateList.size(); i++) {
+                em.merge(updateList.get(i));
+                if (i % 100 == 0) {
+                    em.flush();
+                    em.clear();
+                }
             }
+        }catch (Exception e){
+            ExceptionUtil.catchNonBaseRuntimeException(e,BaseErrorDefine.ERROR_EXECUTE_SAVEBATCH.toRuntimeException());
         }
     }
 
@@ -362,93 +373,99 @@ public class BaseService<T,K extends Serializable> {
      * @param t
      */
     public void saveWithNoRepeatRefer(T t){
-        //1、获取当前对象类型
-        Class clazz= t.getClass();
-        //2、获取当前类型所有带ManyToMany注解的字段集合
-        List<Field> fieldList= BeanUtil.getFieldList(clazz,ManyToMany.class);
-        //3、遍历字段集合
-        fieldList.forEach(field -> {
-            //3.1、获取父关系的注解msg key值
-            Annotation ccAnnotation= field.getAnnotation(ReferCollection.class);
-            if(ccAnnotation==null){
-                ccAnnotation=field.getDeclaredAnnotation(ReferCollection.class);
-            }
-            if(ccAnnotation==null){
-                return;
-            }
-            String msgKey=((ReferCollection)ccAnnotation).saveHasRepeatMessageKey();
+        try {
+            //1、获取当前对象类型
+            Class clazz = t.getClass();
+            //2、获取当前类型所有带ManyToMany注解的字段集合
+            List<Field> fieldList = BeanUtil.getFieldList(clazz, ManyToMany.class);
+            //3、遍历字段集合
+            for(Field field:fieldList){
+                //3.1、获取对应注解的异常信息
+                Annotation ccAnnotation = field.getAnnotation(ReferCollection.class);
+                if (ccAnnotation == null) {
+                    ccAnnotation = field.getDeclaredAnnotation(ReferCollection.class);
+                }
+                if (ccAnnotation == null) {
+                    return;
+                }
 
-            //3.2、获取字段的JoinTable注解
-            Annotation annotation= field.getAnnotation(JoinTable.class);
-            if(annotation==null){
-                annotation=field.getDeclaredAnnotation(JoinTable.class);
-            }
-            if(annotation==null){
-                return;
-            }
-            //3.3、获取JoinTable注解里面的各种值
-            JoinColumn[] joinColumns= ((JoinTable) annotation).joinColumns();
-            JoinColumn[] inverseJoinColumns= ((JoinTable) annotation).inverseJoinColumns();
-            String tableName = ((JoinTable) annotation).name();
-            if(joinColumns==null||joinColumns.length==0
-                    ||inverseJoinColumns==null||inverseJoinColumns.length==0
-                    ||tableName==null){
-                return;
-            }
-            String columnName=joinColumns[0].name();
-            String inverseColumnName=inverseJoinColumns[0].name();
-            if(columnName==null||inverseColumnName==null){
-                return;
-            }
-            //3.4、获取当前字段值、并验证是否属于Set类型
-            String fieldName=field.getName();
-            Object collectionObj= BeanUtil.getFieldVal(t,fieldName);
-            if(collectionObj==null||!Collection.class.isAssignableFrom(collectionObj.getClass())){
-                return;
-            }
+                String msgKey = ((ReferCollection) ccAnnotation).saveHasRepeatMessageKey();
+                String msgValue=I18nUtil.getMessage(msgKey);
 
-            //3.6、获取当前对象主键值
-            Object id=BeanUtil.getPKValByJPAAnnotation(t);
-            //3.7、遍历set集合
-            ((Collection)collectionObj).forEach(e->{
-                //3.7.1、获取关联关系对象主键值
-                Object inverseId= BeanUtil.getPKValByJPAAnnotation(e);
-                //3.7.2、构造关联关系表查询sql
-                StringBuffer sb=new StringBuffer();
-                sb.append("select ");
-                sb.append(columnName);
-                sb.append(" from ");
-                sb.append(tableName);
-                sb.append(" where ");
-                sb.append(inverseColumnName);
-                sb.append("=?");
-                Query query= em.createNativeQuery(sb.toString());
-                query.setParameter(1,inverseId);
+                //3.2、获取字段的JoinTable注解
+                Annotation annotation = field.getAnnotation(JoinTable.class);
+                if (annotation == null) {
+                    annotation = field.getDeclaredAnnotation(JoinTable.class);
+                }
+                if (annotation == null) {
+                    return;
+                }
+                //3.3、获取JoinTable注解里面的各种值
+                JoinColumn[] joinColumns = ((JoinTable) annotation).joinColumns();
+                JoinColumn[] inverseJoinColumns = ((JoinTable) annotation).inverseJoinColumns();
+                String tableName = ((JoinTable) annotation).name();
+                if (joinColumns == null || joinColumns.length == 0
+                        || inverseJoinColumns == null || inverseJoinColumns.length == 0
+                        || tableName == null) {
+                    return;
+                }
+                String columnName = joinColumns[0].name();
+                String inverseColumnName = inverseJoinColumns[0].name();
+                if (columnName == null || inverseColumnName == null) {
+                    return;
+                }
+                //3.4、获取当前字段值、并验证是否属于Set类型
+                String fieldName = field.getName();
+                Object collectionObj = BeanUtil.getFieldVal(t, fieldName);
+                if (collectionObj == null || !Collection.class.isAssignableFrom(collectionObj.getClass())) {
+                    return;
+                }
 
-                //3.7.3、如果当前操作是新增
-                if(id==null){
-                    if(query.getMaxResults()>0){
-                        throw new RuntimeException(I18nUtil.getMessage(msgKey));
-                    }
-                }else{
-                    //3.7.4、如果是编辑
-                    List result= query.getResultList();
-                    //3.7.5、如果关联关系结果大于1条、则说明数据库绑定记录存在错误
-                    if(result.size()>1){
-                        throw new RuntimeException(I18nUtil.getMessage(msgKey));
-                    }else if(result.size()==1){
-                        //3.7.6、如果是1条、则验证绑定关系另一端是不是当前对象
-                        Object dbId=((BigInteger)result.get(0)).longValue();
-                        if(dbId!=id){
-                            throw new RuntimeException(I18nUtil.getMessage(msgKey));
+                //3.6、获取当前对象主键值
+                Object id = BeanUtil.getPKValByJPAAnnotation(t);
+                //3.7、遍历set集合
+                for(Object e:(Collection) collectionObj){
+                    //3.7.1、获取关联关系对象主键值
+                    Object inverseId = BeanUtil.getPKValByJPAAnnotation(e);
+                    //3.7.2、构造关联关系表查询sql
+                    StringBuffer sb = new StringBuffer();
+                    sb.append("select ");
+                    sb.append(columnName);
+                    sb.append(" from ");
+                    sb.append(tableName);
+                    sb.append(" where ");
+                    sb.append(inverseColumnName);
+                    sb.append("=?");
+                    Query query = em.createNativeQuery(sb.toString());
+                    query.setParameter(1, inverseId);
+
+                    //3.7.3、如果当前操作是新增
+                    if (id == null) {
+                        if (query.getMaxResults() > 0) {
+                            throw BaseRuntimeException.getException(msgValue);
+                        }
+                    } else {
+                        //3.7.4、如果是编辑
+                        List result = query.getResultList();
+                        //3.7.5、如果关联关系结果大于1条、则说明数据库绑定记录存在错误
+                        if (result.size() > 1) {
+                            throw BaseRuntimeException.getException(msgValue);
+                        } else if (result.size() == 1) {
+                            //3.7.6、如果是1条、则验证绑定关系另一端是不是当前对象
+                            Object dbId = ((BigInteger) result.get(0)).longValue();
+                            if (dbId != id) {
+                                throw BaseRuntimeException.getException(msgValue);
+                            }
                         }
                     }
                 }
-            });
-        });
+            }
 
-        //4、如果所有的验证均没有抛出异常、则说明没有重复绑定关系;则进行保存
-        save(t);
+            //4、如果所有的验证均没有抛出异常、则说明没有重复绑定关系;则进行保存
+            save(t);
+        }catch(Exception e){
+            ExceptionUtil.catchNonBaseRuntimeException(e,BaseErrorDefine.ERROR_EXECUTE_SAVEWITHNOREPEATREFER.toRuntimeException());
+        }
 
     }
 
@@ -470,43 +487,47 @@ public class BaseService<T,K extends Serializable> {
      */
     @Transactional
     public void deleteWithNoReferred(T t){
-        //1、获取当前对象类型
-        Class clazz= t.getClass();
-        //2、获取当前类型所有带ParentCollection注解的字段集合
-        List<Field> fieldList= BeanUtil.getFieldList(clazz,ReferredCollection.class);
-
-        fieldList.forEach(field->{
-            Annotation annotation= field.getAnnotation(ReferredCollection.class);
-            if(annotation==null){
-                annotation=field.getDeclaredAnnotation(ReferredCollection.class);
-            }
-            if(annotation==null){
-                return;
-            }
-
-            //2.1、获取当前字段值
-            Object objVal=BeanUtil.getFieldVal(t,field.getName());
-            //2.2、如果为空则直接跳过当前字段验证
-            if(objVal==null){
-                return;
-            }
-
-            //2.3、获取父关系的注解msg key值
-            String msgKey=((ReferredCollection)annotation).deleteHasRelationMessageKey();
-            //2.4、如果是属于集合类、则验证集合类元素是否为空
-            if(Collection.class.isAssignableFrom(objVal.getClass())){
-                if(((Collection)objVal).size()>0){
-                    throw new RuntimeException(I18nUtil.getMessage(msgKey));
+        try {
+            //1、获取当前对象类型
+            Class clazz = t.getClass();
+            //2、获取当前类型所有带ParentCollection注解的字段集合
+            List<Field> fieldList = BeanUtil.getFieldList(clazz, ReferredCollection.class);
+            for(Field field:fieldList){
+                Annotation annotation = field.getAnnotation(ReferredCollection.class);
+                if (annotation == null) {
+                    annotation = field.getDeclaredAnnotation(ReferredCollection.class);
                 }
-            }else{
-                //2.5、如果不为空也不为集合类,则说明存在对象引用关联,直接抛出异常
-                throw new RuntimeException(I18nUtil.getMessage(msgKey));
+                if (annotation == null) {
+                    return;
+                }
+
+                //2.1、获取当前字段值
+                Object objVal = BeanUtil.getFieldVal(t, field.getName());
+                //2.2、如果为空则直接跳过当前字段验证
+                if (objVal == null) {
+                    return;
+                }
+
+                //2.3、获取对应注解的异常信息
+                String msgKey = ((ReferredCollection) annotation).deleteHasRelationMessageKey();
+                String msgVal=I18nUtil.getMessage(msgKey);
+                //2.4、如果是属于集合类、则验证集合类元素是否为空
+                if (Collection.class.isAssignableFrom(objVal.getClass())) {
+                    if (((Collection) objVal).size() > 0) {
+                        throw BaseRuntimeException.getException(msgVal);
+                    }
+                } else {
+                    //2.5、如果不为空也不为集合类,则说明存在对象引用关联,直接抛出异常
+                    throw BaseRuntimeException.getException(msgVal);
+                }
+
             }
 
-        });
-
-        //3、如果所有验证都没有抛出异常,则删除
-        delete(t);
+            //3、如果所有验证都没有抛出异常,则删除
+            delete(t);
+        }catch (Exception e){
+            ExceptionUtil.catchNonBaseRuntimeException(e,BaseErrorDefine.ERROR_EXECUTE_DELETEWITHNOREFERRED.toRuntimeException());
+        }
     }
 
     /**
@@ -529,9 +550,8 @@ public class BaseService<T,K extends Serializable> {
     @Transactional
     public boolean isUnique(String fieldName,String val){
         boolean flag = true;
-        List<T> resultList = repository.findAll(new Specification<T>() {
-            @Override
-            public Predicate toPredicate(Root<T> root, CriteriaQuery<?> criteriaQuery, CriteriaBuilder criteriaBuilder) {
+        List<T> resultList = repository.findAll((Root<T> root, CriteriaQuery<?> criteriaQuery, CriteriaBuilder criteriaBuilder)-> {
+            {
                 Predicate predicate = criteriaBuilder.conjunction();
                 List<Expression<Boolean>> expressions = predicate.getExpressions();
                 expressions.add(criteriaBuilder.equal(root.get(fieldName),val));

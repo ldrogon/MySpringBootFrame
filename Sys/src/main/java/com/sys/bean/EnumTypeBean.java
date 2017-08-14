@@ -1,4 +1,4 @@
-package com.base.em.bean;
+package com.sys.bean;
 
 import com.alibaba.fastjson.serializer.SimplePropertyPreFilter;
 import com.base.bean.SuperBaseBean;
